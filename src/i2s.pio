@@ -1,0 +1,36 @@
+.program i2s_left_justified
+.side_set 2
+
+setup:
+    out pins, 1           side 0b00 [1]
+    set x 13              side 0b01
+
+left_channel:
+    in pins, 1            side 0b01
+    out pins, 1           side 0b00 [1]
+    jmp x-- left_channel  side 0b01
+    in pins, 1            side 0b01
+    out pins, 1           side 0b00 [1]
+    set x 12              side 0b01
+    in pins, 1            side 0b01
+    out pins, 1           side 0b10 [1]
+    nop                   side 0b11
+
+right_channel:
+    in pins, 1            side 0b11
+    out pins, 1           side 0b10 [1]
+    jmp x-- right_channel side 0b11
+    in pins, 1            side 0b11
+    out pins, 1           side 0b10 [1]
+    nop                   side 0b11
+    in pins, 1            side 0b11
+    out pins, 1           side 0b10 [1]
+    nop                   side 0b11
+    in pins, 1            side 0b11
+
+
+.program mclk
+.wrap_target
+    set pins, 1
+    set pins, 0
+.wrap
