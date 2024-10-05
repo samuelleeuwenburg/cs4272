@@ -1,0 +1,20 @@
+[package]
+name = "cs4272"
+version = "0.1.0"
+edition = "2021"
+keywords = ["i2s", "pio", "driver", "rp235x", "embedded"]
+categories = ["embedded", "no-std"]
+authors = ["Samuel Leeuwenburg"]
+readme = "README.md"
+repository = "https://github.com/samuelleeuwenburg/cs4272"
+
+[dependencies]
+cortex-m = "0.7.7"
+embedded-hal = "1.0.0"
+fugit = "0.3.7"
+pio = "0.2.1"
+pio-proc = "0.2.2"
+rp235x-hal = {version = "0.2.0", features = ["binary-info", "critical-section-impl", "rt", "defmt"]}
+
+[dev-dependencies]
+panic-halt = "0.2.0"
