@@ -91,14 +91,18 @@ where
         let installed_mclk = pio.install(&pio_mclk.program).unwrap();
         let installed_i2s = pio.install(&pio_i2s.program).unwrap();
 
-        let i2s_clk_frequency = i2s_frequency.raw() * BIT_DEPTH * CHANNELS * PIO_STEPS;
+        let i2s_clk_frequency = i2s_frequency.raw() * BIT_DEPTH * CHANNELS;
 
-        let (i2s_int, i2s_frac) =
-            get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency);
+        // @TODO:
+        // let (i2s_int, i2s_frac) =
+        //     get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency * PIO_STEPS);
+        let (i2s_int, i2s_frac) = (24, 0);
 
+        // @TODO:
         // According to the datasheet MCLK should be set to 8x the CLK speed
-        let (mclk_int, mclk_frac) =
-            get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency * 8);
+        let (mclk_int, mclk_frac) = (6, 0);
+        // let (mclk_int, mclk_frac) =
+        //     get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency * 8 * 2);
 
         let (mut sm_mclk, _, _) = hal::pio::PIOBuilder::from_installed_program(installed_mclk)
             .set_pins(pin_mclk.id().num, 1)
@@ -132,14 +136,12 @@ where
         let sm_mclk = sm_mclk.start();
         let sm_i2s = sm_i2s.start();
 
-        // Enable the interrupts
+        // Enable the interrupt
         unsafe {
             NVIC::unmask(hal::pac::Interrupt::DMA_IRQ_0);
-            NVIC::unmask(hal::pac::Interrupt::DMA_IRQ_1);
         }
 
         channel_a.enable_irq0();
-        channel_b.enable_irq1();
 
         // Start the DMA transfers
         let transfer_tx = single_buffer::Config::new(channel_a, buffer_tx_a, tx_i2s).start();
@@ -167,30 +169,20 @@ where
     }
 
     pub fn handle_irq0(&mut self, cs: &CriticalSection) {
-        let mut transfer = self.transfer_tx.take().unwrap();
-        transfer.check_irq0();
+        let mut transfer_tx = self.transfer_tx.take().unwrap();
 
-        let (channel, previous_buffer, tx) = transfer.wait();
+        transfer_tx.check_irq0();
 
-        // Swap the buffers
-        let next_buffer = self.buffer_tx.borrow(cs).replace(previous_buffer);
+        let (channel_tx, previous_buffer_tx, tx) = transfer_tx.wait();
+        let next_buffer_tx = self.buffer_tx.borrow(cs).replace(previous_buffer_tx);
+        self.transfer_tx = Some(single_buffer::Config::new(channel_tx, next_buffer_tx, tx).start());
 
-        // Restart the DMA transfer
-        self.transfer_tx = Some(single_buffer::Config::new(channel, next_buffer, tx).start());
+        let mut transfer_rx = self.transfer_rx.take().unwrap();
+        let (channel_rx, rx, previous_buffer_rx) = transfer_rx.wait();
+        let next_buffer_rx = self.buffer_rx.borrow(cs).replace(previous_buffer_rx);
+        self.transfer_rx = Some(single_buffer::Config::new(channel_rx, rx, next_buffer_rx).start());
+
         self.buffers_ready = true;
-    }
-
-    pub fn handle_irq1(&mut self, cs: &CriticalSection) {
-        let mut transfer = self.transfer_rx.take().unwrap();
-        transfer.check_irq1();
-
-        let (channel, rx, previous_buffer) = transfer.wait();
-
-        // Swap the buffers
-        let next_buffer = self.buffer_rx.borrow(cs).replace(previous_buffer);
-
-        // Restart the DMA transfer
-        self.transfer_rx = Some(single_buffer::Config::new(channel, rx, next_buffer).start());
     }
 
     pub fn poll(&self) -> bool {

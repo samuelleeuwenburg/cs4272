@@ -116,12 +116,3 @@ fn DMA_IRQ_0() {
         }
     });
 }
-
-#[interrupt]
-fn DMA_IRQ_1() {
-    cortex_m::interrupt::free(|cs| {
-        if let Some(driver) = CS4272.borrow(cs).borrow_mut().as_mut() {
-            driver.handle_irq1(cs);
-        }
-    });
-}
