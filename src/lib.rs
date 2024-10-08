@@ -1,7 +1,79 @@
+//! # CS4272 Crate
+//!
+//! I2S implementation for the
+//! [Cirrus Logic CS4272](https://statics.cirrus.com/pubs/proDatasheet/CS4272_F2.pdf) IC
+//! built using the PIO.
+//!
+//! This driver uses double buffering for both input and output: when one set of buffers is busy
+//! reading/writing to and from the hardware the other set is available to be read and written to.
+//!
+//! The library requires you to handle the switching of the buffers using the `DMA_IRQ_0`
+//! so it makes sense to put the driver into a `Mutex<RefCell<Option<Cs4272>>` for concurrent access.
+//!
+//! ```
+//! const BUFFER_SIZE: usize = 32;
+//!
+//! static CS4272: Mutex<
+//!     RefCell<
+//!         Option<
+//!             Cs4272<
+//!                 BUFFER_SIZE,
+//!                 PIO0,
+//!                 Channel<CH0>,
+//!                 Channel<CH1>,
+//!                 Pin<Gpio0, FunctionSioOutput, PullDown>,
+//!                 Pin<Gpio1, FunctionPio0, PullDown>,
+//!                 Pin<Gpio2, FunctionPio0, PullDown>,
+//!                 Pin<Gpio3, FunctionPio0, PullDown>,
+
+//!                 Pin<Gpio5, FunctionPio0, PullDown>,
+//!             >,
+//!         >,
+//!     >,
+//! > = Mutex::new(RefCell::new(None));
+//! ```
+//!
+//! And handle the interrupt:
+//!
+//! ```
+//! #[interrupt]
+//! fn DMA_IRQ_0() {
+//!     cortex_m::interrupt::free(|cs| {
+//!         if let Some(driver) = CS4272.borrow(cs).borrow_mut().as_mut() {
+//!             driver.handle_irq0();
+//!         }
+//!     });
+//! }
+//! ```
+//!
+//! Using the [Cs4272::poll] method you can check wether or not the current available buffer has already
+//! been written to. This makes it relatively easy to process the data whenever it makes sense for your
+//! application:
+//!
+//! ```
+//! cortex_m::interrupt::free(|cs| {
+//!     if let Some(cs4272) = CS4272.borrow(cs).borrow_mut().as_mut() {
+//!         // Check if the buffers are ready for processing
+//!         if cs4272.poll() {
+//!             // Make a copy of the input buffer for manipulation
+//!             let mut buffer = cs4272.get_input_buffer().clone();
+//!
+//!             // Process input
+//!             for _sample in buffer.iter_mut() { /* ... */ }
+//!
+//!             // Copy the processed buffer to the output
+//!             cs4272.set_output_buffer(&input);
+//!         }
+//!     }
+//! });
+//! ```
+//! Just make sure to keep the processing light or clone the data out of the `interrupt::free`
+//! callback so you won't miss a buffer.
+//!
+
 #![no_std]
 
 use core::cell::{Ref, RefCell};
-use cortex_m::interrupt::{CriticalSection, Mutex};
 use cortex_m::peripheral::NVIC;
 use embedded_hal::digital::OutputPin;
 use hal::dma::single_buffer;
@@ -13,8 +85,8 @@ use rp235x_hal::dma::SingleChannel;
 
 const BIT_DEPTH: u32 = 16;
 const CHANNELS: u32 = 2;
-const PIO_STEPS: u32 = 4;
 
+/// Main driver struct, keeps ownership of all necessary resources
 #[allow(dead_code)]
 pub struct Cs4272<const BUFFER_SIZE: usize, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
 where
@@ -28,20 +100,20 @@ where
     P4: AnyPin,
     P5: AnyPin,
 {
+    buffer_rx: RefCell<&'static mut [u32; BUFFER_SIZE]>,
+    buffer_tx: RefCell<&'static mut [u32; BUFFER_SIZE]>,
     buffers_ready: bool,
-    buffer_tx: Mutex<RefCell<&'static mut [u32; BUFFER_SIZE]>>,
-    buffer_rx: Mutex<RefCell<&'static mut [u32; BUFFER_SIZE]>>,
-    transfer_tx: Option<Transfer<ChA, &'static mut [u32; BUFFER_SIZE], Tx<(Pio, SM1)>>>,
-    transfer_rx: Option<Transfer<ChB, Rx<(Pio, SM1)>, &'static mut [u32; BUFFER_SIZE]>>,
-    pio: PIO<Pio>,
-    sm_mclk: StateMachine<(Pio, SM0), Running>,
-    sm_i2s: StateMachine<(Pio, SM1), Running>,
+    pin_clk: SpecificPin<P5>,
     pin_enable: P0,
-    pin_mclk: SpecificPin<P1>,
     pin_in: SpecificPin<P2>,
+    pin_mclk: SpecificPin<P1>,
     pin_out: SpecificPin<P3>,
     pin_ws: SpecificPin<P4>,
-    pin_clk: SpecificPin<P5>,
+    pio: PIO<Pio>,
+    sm_i2s: StateMachine<(Pio, SM1), Running>,
+    sm_mclk: StateMachine<(Pio, SM0), Running>,
+    transfer_rx: Option<Transfer<ChB, Rx<(Pio, SM1)>, &'static mut [u32; BUFFER_SIZE]>>,
+    transfer_tx: Option<Transfer<ChA, &'static mut [u32; BUFFER_SIZE], Tx<(Pio, SM1)>>>,
 }
 
 impl<const BUFFER_SIZE: usize, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
@@ -57,23 +129,25 @@ where
     P4: AnyPin<Function = Pio::PinFunction>,
     P5: AnyPin<Function = Pio::PinFunction>,
 {
+    /// Construct and start a new [`Cs4272`] instance.
+    ///
     pub fn new(
-        pio: Pio,
-        mut channel_a: ChA,
-        mut channel_b: ChB,
+        resets: &mut hal::pac::RESETS,
         mut pin_enable: P0,
         pin_mclk: P1,
         pin_in: P2,
         pin_out: P3,
         pin_ws: P4,
         pin_clk: P5,
+        pio: Pio,
+        mut channel_a: ChA,
+        channel_b: ChB,
         buffer_tx_a: &'static mut [u32; BUFFER_SIZE],
         buffer_tx_b: &'static mut [u32; BUFFER_SIZE],
         buffer_rx_a: &'static mut [u32; BUFFER_SIZE],
         buffer_rx_b: &'static mut [u32; BUFFER_SIZE],
-        resets: &mut hal::pac::RESETS,
         system_frequency: fugit::HertzU32,
-        i2s_frequency: fugit::HertzU32,
+        sample_rate: fugit::HertzU32,
     ) -> Self {
         let pin_mclk = pin_mclk.into();
         let pin_in = pin_in.into();
@@ -91,18 +165,25 @@ where
         let installed_mclk = pio.install(&pio_mclk.program).unwrap();
         let installed_i2s = pio.install(&pio_i2s.program).unwrap();
 
-        let i2s_clk_frequency = i2s_frequency.raw() * BIT_DEPTH * CHANNELS;
+        let i2s_steps_per_cycle = 4;
+        let mclk_steps_per_cycle = 2;
+        let i2s_clk_frequency = sample_rate.raw() * BIT_DEPTH * CHANNELS;
+        // According to the datasheet the mclk should be 8 times the clk frequency
+        let i2s_mclk_frequency = i2s_clk_frequency * 8;
 
         // @TODO:
-        // let (i2s_int, i2s_frac) =
-        //     get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency * PIO_STEPS);
-        let (i2s_int, i2s_frac) = (24, 0);
+        // let (i2s_int, i2s_frac) = (24, 0);
+        let (i2s_int, i2s_frac) = get_divisions_for_frequency(
+            system_frequency.raw(),
+            i2s_clk_frequency * i2s_steps_per_cycle,
+        );
 
         // @TODO:
-        // According to the datasheet MCLK should be set to 8x the CLK speed
-        let (mclk_int, mclk_frac) = (6, 0);
-        // let (mclk_int, mclk_frac) =
-        //     get_divisions_for_frequency(system_frequency.raw(), i2s_clk_frequency * 8 * 2);
+        // let (mclk_int, mclk_frac) = (6, 0);
+        let (mclk_int, mclk_frac) = get_divisions_for_frequency(
+            system_frequency.raw(),
+            i2s_mclk_frequency * mclk_steps_per_cycle,
+        );
 
         let (mut sm_mclk, _, _) = hal::pio::PIOBuilder::from_installed_program(installed_mclk)
             .set_pins(pin_mclk.id().num, 1)
@@ -116,10 +197,10 @@ where
                 .side_set_pin_base(pin_ws.id().num)
                 .clock_divisor_fixed_point(i2s_int, i2s_frac)
                 .autopull(true)
-                .pull_threshold(32)
+                .pull_threshold(16)
                 .autopush(true)
-                .push_threshold(32)
-                .in_shift_direction(rp235x_hal::pio::ShiftDirection::Left)
+                .push_threshold(16)
+                .in_shift_direction(rp235x_hal::pio::ShiftDirection::Right)
                 .out_shift_direction(rp235x_hal::pio::ShiftDirection::Left)
                 .build(sm_i2s);
 
@@ -160,44 +241,82 @@ where
             pin_out,
             pin_ws,
             pin_clk,
-            buffer_tx: Mutex::new(RefCell::new(buffer_tx_b)),
-            buffer_rx: Mutex::new(RefCell::new(buffer_rx_b)),
+            buffer_tx: RefCell::new(buffer_tx_b),
+            buffer_rx: RefCell::new(buffer_rx_b),
             transfer_tx: Some(transfer_tx),
             transfer_rx: Some(transfer_rx),
             buffers_ready: false,
         }
     }
 
-    pub fn handle_irq0(&mut self, cs: &CriticalSection) {
+    /// Required method for restarting the DMA and swapping the buffers internally.
+    ///
+    /// ```
+    /// #[interrupt]
+    /// fn DMA_IRQ_0() {
+    ///     cortex_m::interrupt::free(|cs| {
+    ///         let mut cs4272 = CS4272.borrow(cs).borrow_mut();
+    ///         cs4272.as_mut().unwrap().handle_irq0();
+    ///     });
+    /// }
+    /// ```
+    pub fn handle_irq0(&mut self) {
         let mut transfer_tx = self.transfer_tx.take().unwrap();
 
         transfer_tx.check_irq0();
 
         let (channel_tx, previous_buffer_tx, tx) = transfer_tx.wait();
-        let next_buffer_tx = self.buffer_tx.borrow(cs).replace(previous_buffer_tx);
+        let next_buffer_tx = self.buffer_tx.replace(previous_buffer_tx);
         self.transfer_tx = Some(single_buffer::Config::new(channel_tx, next_buffer_tx, tx).start());
 
-        let mut transfer_rx = self.transfer_rx.take().unwrap();
+        let transfer_rx = self.transfer_rx.take().unwrap();
         let (channel_rx, rx, previous_buffer_rx) = transfer_rx.wait();
-        let next_buffer_rx = self.buffer_rx.borrow(cs).replace(previous_buffer_rx);
+        let next_buffer_rx = self.buffer_rx.replace(previous_buffer_rx);
         self.transfer_rx = Some(single_buffer::Config::new(channel_rx, rx, next_buffer_rx).start());
 
         self.buffers_ready = true;
     }
 
+    /// Check if the current free output buffer has already been written to.
+    ///
+    /// This makes it easy to periodically check when the driver is ready for new input.
+    ///
+    /// ```
+    /// if cs4272.poll() {
+    ///     // buffer is ready for new input
+    /// }
+    /// ```
     pub fn poll(&self) -> bool {
         self.buffers_ready
     }
 
-    pub fn get_input_buffer<'a>(
-        &'a self,
-        cs: &'a CriticalSection,
-    ) -> Ref<'a, &'static mut [u32; BUFFER_SIZE]> {
-        self.buffer_rx.borrow(cs).borrow()
+    /// Get a reference to the currently free input buffer.
+    ///
+    /// If you are using the driver from a mutex getting to the data
+    /// requires a `cs` from an `interrupt::free` callback for memory safety.
+    /// Consider cloning the buffer to process it without blocking any other interrupts:
+    ///
+    /// ```
+    /// let buffer = cortex_m::interrupt::free(|cs| {
+    ///     CS4272.borrow(cs).borrow_mut().as_ref().unwrap().get_input_buffer().clone()
+    /// });
+    /// ```
+    pub fn get_input_buffer<'a>(&'a self) -> Ref<'a, &'static mut [u32; BUFFER_SIZE]> {
+        self.buffer_rx.borrow()
     }
 
-    pub fn set_output_buffer(&mut self, cs: &CriticalSection, buffer: &[u32; BUFFER_SIZE]) {
-        let mut buffer_tx = self.buffer_tx.borrow(cs).borrow_mut();
+    /// Sets the current free output buffer for the next buffer switch.
+    ///
+    /// ```
+    /// // Output silence
+    /// let buffer: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE];
+    ///
+    /// cortex_m::interrupt::free(|cs| {
+    ///     CS4272.borrow(cs).borrow_mut().as_mut().unwrap().set_output_buffer(&buffer).clone()
+    /// });
+    /// ```
+    pub fn set_output_buffer(&mut self, buffer: &[u32; BUFFER_SIZE]) {
+        let mut buffer_tx = self.buffer_tx.borrow_mut();
         buffer_tx.copy_from_slice(buffer);
         self.buffers_ready = false;
     }
