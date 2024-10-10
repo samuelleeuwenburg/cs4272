@@ -3,8 +3,8 @@
 
 use core::cell::RefCell;
 use cortex_m::interrupt::Mutex;
-use cs4272::Cs4272;
-use hal::clocks::{Clock, ClocksManager};
+use cs4272::{Cs4272, Cs4272Builder};
+use fugit::RateExtU32;
 use hal::dma::{Channel, DMAExt, CH0, CH1};
 use hal::gpio::bank0::{Gpio0, Gpio1, Gpio2, Gpio3, Gpio4, Gpio5};
 use hal::gpio::{FunctionPio0, FunctionSioOutput, Pin, PullDown};
@@ -12,7 +12,6 @@ use hal::pac::{interrupt, PIO0};
 use hal::singleton;
 use panic_halt as _;
 use rp235x_hal as hal;
-use rp235x_hal::fugit::RateExtU32;
 
 #[link_section = ".start_block"]
 #[used]
@@ -43,7 +42,7 @@ static CS4272: Mutex<
 fn DMA_IRQ_0() {
     cortex_m::interrupt::free(|cs| {
         let mut cs4272 = CS4272.borrow(cs).borrow_mut();
-        cs4272.as_mut().unwrap().handle_irq0();
+        cs4272.as_mut().unwrap().handle_irq();
     });
 }
 
@@ -51,7 +50,6 @@ fn DMA_IRQ_0() {
 fn main() -> ! {
     let mut pac = hal::pac::Peripherals::take().unwrap();
     let sio = hal::Sio::new(pac.SIO);
-    let clocks = ClocksManager::new(pac.CLOCKS);
 
     let pins = hal::gpio::Pins::new(
         pac.IO_BANK0,
@@ -62,8 +60,7 @@ fn main() -> ! {
 
     let dma = pac.DMA.split(&mut pac.RESETS);
 
-    let cs4272k = Cs4272::new(
-        &mut pac.RESETS,
+    let cs4272k = Cs4272Builder::new(
         pins.gpio0.into_push_pull_output(),
         pins.gpio1.into_function(),
         pins.gpio2.into_function(),
@@ -77,9 +74,10 @@ fn main() -> ! {
         singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
         singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
         singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
-        clocks.system_clock.freq(),
-        48.kHz(),
-    );
+    )
+    .left_justified_mode()
+    .sample_rate(96.kHz())
+    .start(&mut pac.RESETS);
 
     cortex_m::interrupt::free(|cs| {
         CS4272.borrow(cs).replace(Some(cs4272k));

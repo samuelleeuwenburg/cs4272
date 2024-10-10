@@ -46,6 +46,29 @@
 //! }
 //! ```
 //!
+//! Configure and start the driver:
+//!
+//! ```
+//! let cs4272k = Cs4272Builder::new(
+//!     pins.gpio0.into_push_pull_output(),
+//!     pins.gpio1.into_function(),
+//!     pins.gpio2.into_function(),
+//!     pins.gpio3.into_function(),
+//!     pins.gpio4.into_function(),
+//!     pins.gpio5.into_function(),
+//!     pac.PIO0,
+//!     dma.ch0,
+//!     dma.ch1,
+//!     singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
+//!     singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
+//!     singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
+//!     singleton!(: [u32; BUFFER_SIZE] = [0; BUFFER_SIZE]).unwrap(),
+//! )
+//! .left_justified_mode()
+//! .sample_rate(96.kHz())
+//! .start(&mut pac.RESETS);
+//! ```
+//!
 //! Using the [Cs4272::poll] method you can check wether or not the current available buffer has already
 //! been written to. This makes it relatively easy to process the data whenever it makes sense for your
 //! application:
@@ -72,10 +95,12 @@
 //!
 
 #![no_std]
+#![warn(missing_docs)]
 
 use core::cell::{Ref, RefCell};
 use cortex_m::peripheral::NVIC;
 use embedded_hal::digital::OutputPin;
+use fugit::RateExtU32;
 use hal::dma::single_buffer;
 use hal::gpio::{AnyPin, SpecificPin};
 use hal::pio::{PIOExt, Running, Rx, StateMachine, Tx, PIO, SM0, SM1};
@@ -86,8 +111,292 @@ use rp235x_hal::dma::SingleChannel;
 const BIT_DEPTH: u32 = 16;
 const CHANNELS: u32 = 2;
 
-/// Main driver struct, keeps ownership of all necessary resources
-#[allow(dead_code)]
+enum DmaInterrupt {
+    Irq0,
+    Irq1,
+}
+
+enum Mode {
+    I2s,
+    LeftJustified,
+}
+
+/// [Cs4272] builder, used to initialize, configure and start the driver
+pub struct Cs4272Builder<const BUFFER_SIZE: usize, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
+where
+    P1: AnyPin,
+    P2: AnyPin,
+    P3: AnyPin,
+    P4: AnyPin,
+    P5: AnyPin,
+{
+    pio: Option<Pio>,
+    channel_a: Option<ChA>,
+    channel_b: Option<ChB>,
+    buffer_tx_a: Option<&'static mut [u32; BUFFER_SIZE]>,
+    buffer_tx_b: &'static mut [u32; BUFFER_SIZE],
+    buffer_rx_a: Option<&'static mut [u32; BUFFER_SIZE]>,
+    buffer_rx_b: &'static mut [u32; BUFFER_SIZE],
+    pin_enable: P0,
+    pin_mclk: SpecificPin<P1>,
+    pin_in: SpecificPin<P2>,
+    pin_out: SpecificPin<P3>,
+    pin_ws: SpecificPin<P4>,
+    pin_clk: SpecificPin<P5>,
+    system_frequency: fugit::HertzU32,
+    sample_rate: fugit::HertzU32,
+    interrupt: DmaInterrupt,
+    mode: Mode,
+}
+
+impl<const BUFFER_SIZE: usize, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
+    Cs4272Builder<BUFFER_SIZE, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
+where
+    P0: OutputPin,
+    P1: AnyPin<Function = Pio::PinFunction>,
+    P2: AnyPin<Function = Pio::PinFunction>,
+    P3: AnyPin<Function = Pio::PinFunction>,
+    P4: AnyPin<Function = Pio::PinFunction>,
+    P5: AnyPin<Function = Pio::PinFunction>,
+    Pio: PIOExt,
+    ChA: SingleChannel,
+    ChB: SingleChannel,
+{
+    /// Initialize a new builder.
+    ///
+    /// Requires passing all the necessary pins, DMAs, pio and buffers we need to run the driver.
+    pub fn new(
+        mut pin_enable: P0,
+        pin_mclk: P1,
+        pin_in: P2,
+        pin_out: P3,
+        pin_ws: P4,
+        pin_clk: P5,
+        pio: Pio,
+        channel_a: ChA,
+        channel_b: ChB,
+        buffer_tx_a: &'static mut [u32; BUFFER_SIZE],
+        buffer_tx_b: &'static mut [u32; BUFFER_SIZE],
+        buffer_rx_a: &'static mut [u32; BUFFER_SIZE],
+        buffer_rx_b: &'static mut [u32; BUFFER_SIZE],
+    ) -> Self {
+        // Hold down the enable pin
+        pin_enable.set_low().unwrap();
+
+        Cs4272Builder {
+            pin_enable,
+            pin_mclk: pin_mclk.into(),
+            pin_in: pin_in.into(),
+            pin_out: pin_out.into(),
+            pin_ws: pin_ws.into(),
+            pin_clk: pin_clk.into(),
+            pio: Some(pio),
+            channel_a: Some(channel_a),
+            channel_b: Some(channel_b),
+            buffer_tx_a: Some(buffer_tx_a),
+            buffer_tx_b,
+            buffer_rx_a: Some(buffer_rx_a),
+            buffer_rx_b,
+            system_frequency: 150.MHz(),
+            sample_rate: 48.kHz(),
+            interrupt: DmaInterrupt::Irq0,
+            mode: Mode::LeftJustified,
+        }
+    }
+
+    /// Set the driver sample rate.
+    ///
+    /// The CS4272 chip supports sample rates between `4kHz` and `200kHz`,
+    /// defaults to `48kHz`.
+    pub fn sample_rate(mut self, sample_rate: fugit::HertzU32) -> Self {
+        self.sample_rate = sample_rate;
+        self
+    }
+
+    /// Set the RP235x system frequency.
+    ///
+    /// In case you have changed the frequency of the system you should update this value,
+    /// defaults to `150MHz`.
+    pub fn system_frequency(mut self, system_frequency: fugit::HertzU32) -> Self {
+        self.system_frequency = system_frequency;
+        self
+    }
+
+    /// Sets up interrupt `DMA_IRQ_0` for the DMA.
+    pub fn set_irq0(mut self) -> Self {
+        self.interrupt = DmaInterrupt::Irq0;
+        self
+    }
+
+    /// Sets up interrupt `DMA_IRQ_1` for the DMA.
+    pub fn set_irq1(mut self) -> Self {
+        self.interrupt = DmaInterrupt::Irq1;
+        self
+    }
+
+    /// Puts the PIO in left justified mode.
+    pub fn left_justified_mode(mut self) -> Self {
+        self.mode = Mode::LeftJustified;
+        self
+    }
+
+    /// Puts the PIO in I2S mode.
+    pub fn i2s_mode(mut self) -> Self {
+        self.mode = Mode::I2s;
+        self
+    }
+
+    /// Starts the PIO and DMAs, then sets the enable pin high and returns the running driver struct.
+    pub fn start(
+        mut self,
+        resets: &mut hal::pac::RESETS,
+    ) -> Cs4272<BUFFER_SIZE, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5> {
+        // Start the PIOs
+        let (pio, sm_mclk, sm_i2s, tx, rx) = self.start_pio(resets);
+
+        // Start the DMAs
+        let (transfer_tx, transfer_rx) = self.start_dma(tx, rx);
+
+        // Pull up the enable pin
+        self.pin_enable.set_high().unwrap();
+
+        Cs4272 {
+            pio,
+            sm_mclk,
+            sm_i2s,
+            pin_enable: self.pin_enable,
+            pin_mclk: self.pin_mclk,
+            pin_in: self.pin_in,
+            pin_out: self.pin_out,
+            pin_ws: self.pin_ws,
+            pin_clk: self.pin_clk,
+            buffer_tx: RefCell::new(self.buffer_tx_b),
+            buffer_rx: RefCell::new(self.buffer_rx_b),
+            transfer_tx: Some(transfer_tx),
+            transfer_rx: Some(transfer_rx),
+            buffers_ready: false,
+        }
+    }
+
+    fn start_dma(
+        &mut self,
+        tx: Tx<(Pio, SM1)>,
+        rx: Rx<(Pio, SM1)>,
+    ) -> (
+        Transfer<ChA, &'static mut [u32; BUFFER_SIZE], Tx<(Pio, SM1)>>,
+        Transfer<ChB, Rx<(Pio, SM1)>, &'static mut [u32; BUFFER_SIZE]>,
+    ) {
+        let mut channel_a = self.channel_a.take().unwrap();
+        let channel_b = self.channel_b.take().unwrap();
+        let buffer_tx = self.buffer_tx_a.take().unwrap();
+        let buffer_rx = self.buffer_rx_a.take().unwrap();
+
+        // Enable the interrupt
+        match self.interrupt {
+            DmaInterrupt::Irq0 => {
+                unsafe { NVIC::unmask(hal::pac::Interrupt::DMA_IRQ_0) };
+                channel_a.enable_irq0();
+            }
+            DmaInterrupt::Irq1 => {
+                unsafe { NVIC::unmask(hal::pac::Interrupt::DMA_IRQ_1) };
+                channel_a.enable_irq1();
+            }
+        }
+        // Start the DMA transfers
+        let transfer_tx = single_buffer::Config::new(channel_a, buffer_tx, tx).start();
+        let transfer_rx = single_buffer::Config::new(channel_b, rx, buffer_rx).start();
+
+        (transfer_tx, transfer_rx)
+    }
+
+    fn start_pio(
+        &mut self,
+        resets: &mut hal::pac::RESETS,
+    ) -> (
+        PIO<Pio>,
+        StateMachine<(Pio, SM0), Running>,
+        StateMachine<(Pio, SM1), Running>,
+        Tx<(Pio, SM1)>,
+        Rx<(Pio, SM1)>,
+    ) {
+        let pio = self.pio.take().unwrap();
+        let (mut pio, sm_mclk, sm_i2s, _, _) = pio.split(resets);
+
+        let pio_mclk = pio_proc::pio_file!("src/i2s.pio", select_program("mclk"));
+        let pio_i2s = pio_proc::pio_file!("src/i2s.pio", select_program("i2s"));
+        let pio_left_justified =
+            pio_proc::pio_file!("src/i2s.pio", select_program("left_justified"));
+
+        let installed_mclk = pio.install(&pio_mclk.program).unwrap();
+        let installed_i2s = match self.mode {
+            Mode::I2s => pio.install(&pio_i2s.program).unwrap(),
+            Mode::LeftJustified => pio.install(&pio_left_justified.program).unwrap(),
+        };
+
+        let i2s_steps_per_cycle = 4;
+        let mclk_steps_per_cycle = 2;
+        let i2s_clk_frequency = self.sample_rate.raw() * BIT_DEPTH * CHANNELS;
+        // According to the datasheet the mclk should be 8 times the clk frequency
+        let i2s_mclk_frequency = i2s_clk_frequency * 8;
+
+        // @TODO:
+        // let (i2s_int, i2s_frac) = (24, 0);
+        let (i2s_int, i2s_frac) = get_divisions_for_frequency(
+            self.system_frequency.raw(),
+            i2s_clk_frequency * i2s_steps_per_cycle,
+        );
+
+        // @TODO:
+        // let (mclk_int, mclk_frac) = (6, 0);
+        let (mclk_int, mclk_frac) = get_divisions_for_frequency(
+            self.system_frequency.raw(),
+            i2s_mclk_frequency * mclk_steps_per_cycle,
+        );
+
+        let (mut sm_mclk, _, _) = hal::pio::PIOBuilder::from_installed_program(installed_mclk)
+            .set_pins(self.pin_mclk.id().num, 1)
+            .clock_divisor_fixed_point(mclk_int, mclk_frac)
+            .build(sm_mclk);
+
+        let (mut sm_i2s, rx, tx) = hal::pio::PIOBuilder::from_installed_program(installed_i2s)
+            .in_pin_base(self.pin_in.id().num)
+            .out_pins(self.pin_out.id().num, 1)
+            .side_set_pin_base(self.pin_ws.id().num)
+            .clock_divisor_fixed_point(i2s_int, i2s_frac)
+            .autopull(true)
+            .pull_threshold(32)
+            .autopush(true)
+            .push_threshold(32)
+            .in_shift_direction(rp235x_hal::pio::ShiftDirection::Left)
+            .out_shift_direction(rp235x_hal::pio::ShiftDirection::Left)
+            .build(sm_i2s);
+
+        sm_mclk.set_pindirs([(self.pin_mclk.id().num, hal::pio::PinDir::Output)]);
+
+        sm_i2s.set_pindirs([
+            (self.pin_in.id().num, hal::pio::PinDir::Input),
+            (self.pin_out.id().num, hal::pio::PinDir::Output),
+            (self.pin_ws.id().num, hal::pio::PinDir::Output),
+            (self.pin_clk.id().num, hal::pio::PinDir::Output),
+        ]);
+
+        // Start the PIO state machines
+        let sm_mclk = sm_mclk.start();
+        let sm_i2s = sm_i2s.start();
+
+        (pio, sm_mclk, sm_i2s, tx, rx)
+    }
+}
+
+fn get_divisions_for_frequency(cpu: u32, target: u32) -> (u16, u8) {
+    let int = cpu / target;
+    let fraction = ((cpu % target) as f32 / target as f32) * 256.0;
+
+    (int as u16, fraction as u8)
+}
+
+/// Main driver struct, keeps ownership of all necessary resources while the driver is running
+/// #[allow(dead_code)]
 pub struct Cs4272<const BUFFER_SIZE: usize, Pio, ChA, ChB, P0, P1, P2, P3, P4, P5>
 where
     Pio: PIOExt,
@@ -129,126 +438,6 @@ where
     P4: AnyPin<Function = Pio::PinFunction>,
     P5: AnyPin<Function = Pio::PinFunction>,
 {
-    /// Construct and start a new [`Cs4272`] instance.
-    ///
-    pub fn new(
-        resets: &mut hal::pac::RESETS,
-        mut pin_enable: P0,
-        pin_mclk: P1,
-        pin_in: P2,
-        pin_out: P3,
-        pin_ws: P4,
-        pin_clk: P5,
-        pio: Pio,
-        mut channel_a: ChA,
-        channel_b: ChB,
-        buffer_tx_a: &'static mut [u32; BUFFER_SIZE],
-        buffer_tx_b: &'static mut [u32; BUFFER_SIZE],
-        buffer_rx_a: &'static mut [u32; BUFFER_SIZE],
-        buffer_rx_b: &'static mut [u32; BUFFER_SIZE],
-        system_frequency: fugit::HertzU32,
-        sample_rate: fugit::HertzU32,
-    ) -> Self {
-        let pin_mclk = pin_mclk.into();
-        let pin_in = pin_in.into();
-        let pin_out = pin_out.into();
-        let pin_ws = pin_ws.into();
-        let pin_clk = pin_clk.into();
-
-        pin_enable.set_low().unwrap();
-
-        let (mut pio, sm_mclk, sm_i2s, _, _) = pio.split(resets);
-
-        let pio_mclk = pio_proc::pio_file!("src/i2s.pio", select_program("mclk"));
-        let pio_i2s = pio_proc::pio_file!("src/i2s.pio", select_program("i2s"));
-
-        let installed_mclk = pio.install(&pio_mclk.program).unwrap();
-        let installed_i2s = pio.install(&pio_i2s.program).unwrap();
-
-        let i2s_steps_per_cycle = 4;
-        let mclk_steps_per_cycle = 2;
-        let i2s_clk_frequency = sample_rate.raw() * BIT_DEPTH * CHANNELS;
-        // According to the datasheet the mclk should be 8 times the clk frequency
-        let i2s_mclk_frequency = i2s_clk_frequency * 8;
-
-        // @TODO:
-        // let (i2s_int, i2s_frac) = (24, 0);
-        let (i2s_int, i2s_frac) = get_divisions_for_frequency(
-            system_frequency.raw(),
-            i2s_clk_frequency * i2s_steps_per_cycle,
-        );
-
-        // @TODO:
-        // let (mclk_int, mclk_frac) = (6, 0);
-        let (mclk_int, mclk_frac) = get_divisions_for_frequency(
-            system_frequency.raw(),
-            i2s_mclk_frequency * mclk_steps_per_cycle,
-        );
-
-        let (mut sm_mclk, _, _) = hal::pio::PIOBuilder::from_installed_program(installed_mclk)
-            .set_pins(pin_mclk.id().num, 1)
-            .clock_divisor_fixed_point(mclk_int, mclk_frac)
-            .build(sm_mclk);
-
-        let (mut sm_i2s, rx_i2s, tx_i2s) =
-            hal::pio::PIOBuilder::from_installed_program(installed_i2s)
-                .in_pin_base(pin_in.id().num)
-                .out_pins(pin_out.id().num, 1)
-                .side_set_pin_base(pin_ws.id().num)
-                .clock_divisor_fixed_point(i2s_int, i2s_frac)
-                .autopull(true)
-                .pull_threshold(16)
-                .autopush(true)
-                .push_threshold(16)
-                .in_shift_direction(rp235x_hal::pio::ShiftDirection::Right)
-                .out_shift_direction(rp235x_hal::pio::ShiftDirection::Left)
-                .build(sm_i2s);
-
-        sm_mclk.set_pindirs([(pin_mclk.id().num, hal::pio::PinDir::Output)]);
-
-        sm_i2s.set_pindirs([
-            (pin_in.id().num, hal::pio::PinDir::Input),
-            (pin_out.id().num, hal::pio::PinDir::Output),
-            (pin_ws.id().num, hal::pio::PinDir::Output),
-            (pin_clk.id().num, hal::pio::PinDir::Output),
-        ]);
-
-        // Start the PIO state machines
-        let sm_mclk = sm_mclk.start();
-        let sm_i2s = sm_i2s.start();
-
-        // Enable the interrupt
-        unsafe {
-            NVIC::unmask(hal::pac::Interrupt::DMA_IRQ_0);
-        }
-
-        channel_a.enable_irq0();
-
-        // Start the DMA transfers
-        let transfer_tx = single_buffer::Config::new(channel_a, buffer_tx_a, tx_i2s).start();
-        let transfer_rx = single_buffer::Config::new(channel_b, rx_i2s, buffer_rx_a).start();
-
-        // Pull up the enable pin
-        pin_enable.set_high().unwrap();
-
-        Cs4272 {
-            pio,
-            sm_mclk,
-            sm_i2s,
-            pin_enable,
-            pin_mclk,
-            pin_in,
-            pin_out,
-            pin_ws,
-            pin_clk,
-            buffer_tx: RefCell::new(buffer_tx_b),
-            buffer_rx: RefCell::new(buffer_rx_b),
-            transfer_tx: Some(transfer_tx),
-            transfer_rx: Some(transfer_rx),
-            buffers_ready: false,
-        }
-    }
-
     /// Required method for restarting the DMA and swapping the buffers internally.
     ///
     /// ```
@@ -256,14 +445,15 @@ where
     /// fn DMA_IRQ_0() {
     ///     cortex_m::interrupt::free(|cs| {
     ///         let mut cs4272 = CS4272.borrow(cs).borrow_mut();
-    ///         cs4272.as_mut().unwrap().handle_irq0();
+    ///         cs4272.as_mut().unwrap().handle_irq();
     ///     });
     /// }
     /// ```
-    pub fn handle_irq0(&mut self) {
+    pub fn handle_irq(&mut self) {
         let mut transfer_tx = self.transfer_tx.take().unwrap();
 
         transfer_tx.check_irq0();
+        transfer_tx.check_irq1();
 
         let (channel_tx, previous_buffer_tx, tx) = transfer_tx.wait();
         let next_buffer_tx = self.buffer_tx.replace(previous_buffer_tx);
@@ -320,11 +510,4 @@ where
         buffer_tx.copy_from_slice(buffer);
         self.buffers_ready = false;
     }
-}
-
-fn get_divisions_for_frequency(cpu: u32, target: u32) -> (u16, u8) {
-    let int = cpu / target;
-    let fraction = ((cpu % target) as f32 / target as f32) * 256.0;
-
-    (int as u16, fraction as u8)
 }
